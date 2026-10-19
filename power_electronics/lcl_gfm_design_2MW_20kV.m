@@ -24,7 +24,7 @@
 %
 %  Edit default_params() at the bottom of this file, then run the script.
 %
-%  This copy is parameterised for a 2 MW GFM inverter (Vdc = 750 V) connected
+%  This copy is parameterised for a 2 MW GFM inverter (Vdc = 763 V) connected
 %  through a 20 kV / 400 V transformer to a 50 Hz, 20 kV grid with moderate X/R.
 %  The step-up transformer is mandatory, so only case 'B' is run.
 
@@ -73,7 +73,7 @@ p.S        = 2.2e6;           % inverter apparent power [VA] (P_max with |Q| <= 
 p.Vll_grid = 20e3;            % grid (MV) line-line rms voltage [V]
 p.Vll_conv = 400;             % converter-side line-line rms voltage [V] (trafo LV side)
 p.f1       = 50;              % grid frequency [Hz]
-p.Vdc      = 750;             % dc-link voltage [V]
+p.Vdc      = 763;             % dc-link voltage [V]
 p.fsw      = 4e3;             % switching frequency [Hz] (MW-class IGBT stack, Tsw = 250 us)
 p.update   = 'double';        % 'single' (fs = fsw) or 'double' (fs = 2 fsw = 8 kHz)
 p.modulation = 'svpwm';       % 'svpwm' (min-max injection) or 'spwm'
