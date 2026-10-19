@@ -10,6 +10,10 @@
 %  Damping topologies (p.damping):
 %    'series' : Rd in series with the whole capacitor              (Liserre 2005)
 %    'split'  : C = Cf + Cd, Rd in series with Cd only             (Pena-Alzola 2013)
+%    'active' : no damping resistor; capacitor-current feedback ic -> modulator
+%               (virtual resistor, gain Kad is a design variable)     (Parker 2014, Dannehl 2010)
+%    'none'   : no damping resistor and no active damping; relies on the inherent
+%               damping of inverter-current feedback with delay (f_res > fs/6)  (Parker 2014)
 %
 %  Design flow
 %   1 base quantities, grid impedance from SCR and X/R
@@ -77,7 +81,7 @@ p.Vdc      = 763;             % dc-link voltage [V]
 p.fsw      = 4e3;             % switching frequency [Hz] (MW-class IGBT stack, Tsw = 250 us)
 p.update   = 'double';        % 'single' (fs = fsw) or 'double' (fs = 2 fsw = 8 kHz)
 p.modulation = 'svpwm';       % 'svpwm' (min-max injection) or 'spwm'
-p.damping  = 'split';         % 'split' or 'series'
+p.damping  = 'active';        % 'active', 'none', 'split' or 'series' (no damping resistor: 'active'/'none')
 % --- grid
 p.SCR_nom  = 7;               % nominal SCR at the PCC (20 kV side, on base S)
 p.XR_grid  = 5;               % grid X/R (moderate, typical 20 kV distribution feeder)
@@ -112,6 +116,7 @@ p.Pd_max = 0.003;  p.sm_min = 0.40;
 % --- optimisation
 p.bounds_L1 = [0.03 0.25];  p.bounds_C = [0.005 NaN];  p.bounds_L2 = [0.005 0.15];
 p.bounds_Rd = [0.002 1.0];  p.bounds_kd = [0.1 0.9];
+p.bounds_Kad = [0 10];        % capacitor-current feedback gain [pu of Zb] ('active')
 p.w_THDi = 1; p.w_THDv = 1; p.w_margin = 2; p.w_size = 0.1;
 p.ref_THDi = 0.05; p.ref_THDv = 0.05; p.ref_margin = 0.5; p.ref_size = 0.10;
 p.de_popsize = 20; p.de_maxiter = 80; p.de_seed = 1;
@@ -145,13 +150,24 @@ R = (1/SCR)/sqrt(1 + XR^2);  X = R*XR;
 end
 
 function nv = n_vars(p)
-nv = 4 + strcmp(p.damping, 'split');
+nv = 4 + strcmp(p.damping, 'split') - strcmp(p.damping, 'none');
+end
+
+function tf = no_resistor(p)
+tf = any(strcmp(p.damping, {'active', 'none'}));
 end
 
 function d = unpack(x, p, b)
-% x = [L1 pu, C pu, L2 pu (A) or uk (B), Rd pu, (kd = Cd/C for 'split')]
-d.L1pu = x(1);  d.Cpu = x(2);  d.Rdpu = x(4);
-if strcmp(p.damping, 'split'), d.kd = x(5); else, d.kd = 1; end
+% x = [L1 pu, C pu, L2 pu (A) or uk (B), Rd pu ('split'/'series') or Kad pu ('active'),
+%      (kd = Cd/C for 'split')]
+d.L1pu = x(1);  d.Cpu = x(2);  d.Kadpu = 0;
+if no_resistor(p)
+    d.Rdpu = 0;  d.kd = 0;
+    if strcmp(p.damping, 'active'), d.Kadpu = x(4); end
+else
+    d.Rdpu = x(4);
+    if strcmp(p.damping, 'split'), d.kd = x(5); else, d.kd = 1; end
+end
 if strcmp(p.config, 'B')
     uk = x(3);  rk = min(p.trafo_rk, 0.999*uk);  d.uk = uk;   % on S_trafo base
     kt = p.S/p.S_trafo;                                      % S_trafo base -> inverter base S
@@ -163,9 +179,11 @@ end
 d.R1pu = d.L1pu/p.QL1;
 d.L1 = d.L1pu*b.Lb;  d.C = d.Cpu*b.Cb;  d.Cd = d.kd*d.C;  d.Cf = d.C - d.Cd;
 d.L2 = d.X2pu*b.Lb;  d.R1 = d.R1pu*b.Zb;  d.R2 = d.R2pu*b.Zb;  d.Rd = d.Rdpu*b.Zb;
+d.Kad = d.Kadpu*b.Zb;
 end
 
 function Z = cap_branch_Z(d, s)
+if d.Cd <= 0, Z = 1./(s*d.Cf); return; end
 Zd = d.Rd + 1./(s*d.Cd);
 if d.Cf <= 0, Z = Zd; return; end
 Zf = 1./(s*d.Cf);  Z = Zf.*Zd./(Zf + Zd);
@@ -192,6 +210,8 @@ wres = sqrt((L1 + L2t)/(L1*L2t*C));
 Rd   = 1/(3*wres*C);                            % Liserre's rule of thumb
 x = [L1/b.Lb, C/b.Cb, X2, Rd/b.Zb];
 if strcmp(p.damping, 'split'), x(5) = 0.5; end
+if strcmp(p.damping, 'active'), x(4) = 2*0.7*wres*L1/b.Zb; end   % Kad = 2 zeta wres L1
+if strcmp(p.damping, 'none'), x = x(1:3); end
 end
 
 %% ========================================================================
@@ -239,6 +259,11 @@ end
 function op = operating_point(d, p, Q)
 i2 = conj((p.P_op + 1i*Q)/p.V_pcc);
 vf = p.V_pcc + (d.R2pu + 1i*d.X2pu)*i2;
+if d.kd <= 0
+    vf = p.V_pcc + (d.R2pu + 1i*d.X2pu)*i2;  i1 = i2 + vf*1i*d.Cpu;
+    op.v1 = vf + (d.R1pu + 1i*d.L1pu)*i1;
+    op.vf = vf;  op.i1 = i1;  op.i2 = i2;  op.id = 0;  return;
+end
 Zd = d.Rdpu - 1i/(d.kd*d.Cpu);
 if d.kd < 1
     Zf = -1i/((1 - d.kd)*d.Cpu);  Zc = Zf*Zd/(Zf + Zd);
@@ -266,7 +291,7 @@ I1 = Vn./(Z1 + Zc.*Z2./(Zc + Z2));
 I2 = I1.*Zc./(Zc + Z2);
 Vf = I2.*Z2;                                    % filter-node (capacitor) voltage
 Vpcc = I2.*(Rg + s*Lg);
-Id = Vf./(d.Rd + 1./(s*d.Cd));
+if d.Cd > 0, Id = Vf./(d.Rd + 1./(s*d.Cd)); else, Id = zeros(size(Vf)); end
 h = n >= 2;
 H.TDD_i2   = sqrt(sum(abs(I2(h)).^2))/b.I_pk;
 H.Ih_max   = max(abs(I2(n >= 35)))/b.I_pk;
@@ -300,7 +325,13 @@ end
 
 function [A, B, Ci1, Cvf, Ci2] = plant_ss(d, R2t, L2t)
 L1 = d.L1; R1 = d.R1; Rd = d.Rd; C = d.C;
-if d.Cf <= 0          % 'series': x = [i1 vc i2]
+if d.Cd <= 0          % no damping resistor: x = [i1 vc i2]
+    A = [-R1/L1, -1/L1,  0;
+          1/C,     0,   -1/C;
+          0,     1/L2t, -R2t/L2t];
+    B = [1/L1; 0; 0];
+    Ci1 = [1 0 0];  Cvf = [0 1 0];  Ci2 = [0 0 1];
+elseif d.Cf <= 0      % 'series': x = [i1 vc i2]
     A = [-(R1+Rd)/L1, -1/L1,  Rd/L1;
           1/C,          0,    -1/C;
           Rd/L2t,     1/L2t, -(R2t+Rd)/L2t];
@@ -344,7 +375,7 @@ Aol(npl+2:n, 1:npl)   = -Brd*Cvf;
 Aol(npl+2:n, npl+2:n) = Ard;
 Bw = zeros(n, 1);  Bw(iu) = 1;
 Ku = zeros(1, n);
-Ku(1:npl)   = Kpi*(-Kpv*Cvf + kff*Ci2 - Ci1);
+Ku(1:npl)   = Kpi*(-Kpv*Cvf + kff*Ci2 - Ci1) - d.Kad*(Ci1 - Ci2);   % active damping: -Kad*ic
 Ku(npl+2:n) = Kpi*Krv*Cr;
 Acl = Aol;  Acl(iu, :) = Ku;
 end
@@ -468,8 +499,12 @@ end
 
 function bnds = opt_bounds(p)
 bC = p.bounds_C;  if isnan(bC(2)), bC(2) = p.x_max; end
-bnds = [p.bounds_L1; bC; p.bounds_L2; p.bounds_Rd];
-if strcmp(p.damping, 'split'), bnds = [bnds; p.bounds_kd]; end
+bnds = [p.bounds_L1; bC; p.bounds_L2];
+switch p.damping
+    case 'active', bnds = [bnds; p.bounds_Kad];
+    case 'series', bnds = [bnds; p.bounds_Rd];
+    case 'split',  bnds = [bnds; p.bounds_Rd; p.bounds_kd];
+end
 end
 
 function [xbest, logd] = optimise(p)
@@ -538,7 +573,9 @@ fprintf('--- %s ---\n', title);
 fprintf('  Base: %.2f MVA, %.0f V, I_rated = %.0f A rms, Zb = %.2f mohm\n', p.S/1e6, b.Vb, ...
         b.I_pk/sqrt(2), b.Zb*1e3);
 fprintf('  L1 = %7.2f uH  (%.4f pu)\n', d.L1*1e6, d.L1pu);
-if d.Cf > 0
+if d.Cd <= 0
+    fprintf('  C  = %7.2f uF per phase, Y (%.4f pu), no damping resistor\n', d.C*1e6, d.Cpu);
+elseif d.Cf > 0
     fprintf('  C  = %7.2f uF per phase, Y (%.4f pu) = Cf %.2f uF || (Rd + Cd %.2f uF)\n', ...
             d.C*1e6, d.Cpu, d.Cf*1e6, d.Cd*1e6);
 else
@@ -551,7 +588,12 @@ if strcmp(p.config, 'B')
 else
     fprintf('  L2 = %7.3f mH  (%.4f pu)\n', d.L2*1e3, d.X2pu);
 end
-fprintf('  Rd = %7.3f mohm (%.4f pu)\n', d.Rd*1e3, d.Rdpu);
+if strcmp(p.damping, 'active')
+    fprintf('  Active damping: ic feedback gain Kad = %.3f mohm (%.4f pu) = %.2f V/kA\n', ...
+            d.Kad*1e3, d.Kadpu, d.Kad*1e3);
+elseif ~no_resistor(p)
+    fprintf('  Rd = %7.3f mohm (%.4f pu)\n', d.Rd*1e3, d.Rdpu);
+end
 fprintf('  f_res over SCR %g..%g = %.0f .. %.0f Hz   (fs/6 = %.0f Hz)\n', min(p.SCR_set), ...
         max(p.SCR_set), r.fres_range(1), r.fres_range(2), b.fs/6);
 fprintf('  Worst-case modulation index (P=%.3g, |Q|<=%g) = %.3f   (limit %.3f)\n', p.P_op, p.Q_max, ...
